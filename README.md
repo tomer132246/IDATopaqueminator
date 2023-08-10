@@ -7,7 +7,7 @@ IDA plugin for simple opaque predicates removal using symbolic execution with an
 
 
 # Usage
-- Ctrl-Shift-T To recieve an anlysis on the current function (the one you are viewing.).
+- Ctrl-Alt-T To recieve an anlysis on the current function (the one you are viewing.).
 - NOTE:
   1. The results may be inaccurate!. The plugin is instrumentlizing the shell-code of the current function without prior context knowledge.
   2. THE PLUGIN WILL AND SHALL NOT DO ANY CHANGES TO YOUR IDB.
