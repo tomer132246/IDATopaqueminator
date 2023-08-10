@@ -3,7 +3,8 @@ IDA plugin for simple opaque predicates removal using symbolic execution with an
 
 # Dependencies
 - IDA 7.x
-- Angr (latest version.)
+- Angr (pip install latest version.)
+- Keystone (you can probably remove this prequisite from the code, im using it only for testing.)
 - Tested with python 3.9
 
 
@@ -18,6 +19,11 @@ IDA plugin for simple opaque predicates removal using symbolic execution with an
   2. THE PLUGIN WILL AND SHALL NOT DO ANY CHANGES TO YOUR IDB.
   3. The analyzing is currently done per-basic-block. *(https://en.wikipedia.org/wiki/Basic_block)
 
+
+# TODO
+1. Multiple blocks analyzing.
+    - Need to propagate the information in-between basic blocks.
+3. Better loop handling.
 
 
 
