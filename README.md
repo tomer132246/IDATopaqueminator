@@ -1,6 +1,11 @@
 # IDATopaqueminator
 IDA plugin for simple opaque predicates removal using symbolic execution with angr
 
+# Dependencies
+- IDA 7.x
+- Angr (latest version.)
+- Tested with python 3.9
+
 
 # Installation
 - Simply place the .py files in the %IDA_INSTALLATION%\plugins.
