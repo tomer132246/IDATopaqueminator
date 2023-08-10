@@ -1,5 +1,5 @@
 # IDATopaqueminator
-IDA plugin for simple opaque predicates removal using symbolic execution with angr
+IDA plugin for (currently) simple opaque predicates removal using symbolic execution with angr
 
 # Dependencies
 - IDA 7.x
