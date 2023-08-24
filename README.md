@@ -20,10 +20,4 @@ IDA plugin for (currently) simple opaque predicates removal using symbolic execu
   3. The analyzing is currently done per-basic-block. *(https://en.wikipedia.org/wiki/Basic_block)
 
 
-# TODO
-1. Multiple blocks analyzing.
-    - Need to propagate the information in-between basic blocks.
-3. Better loop handling.
-
-
 
