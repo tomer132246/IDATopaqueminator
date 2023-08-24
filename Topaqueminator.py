@@ -5,34 +5,29 @@ import angr
 import warnings
 import keystone
 warnings.filterwarnings("ignore")
-####################################################################
-#Constants.
-####################################################################
+"""###########################################################################################################################"""
 T_VER = 9
 DEBUG = 1
+UNKNOWN_STATE
+"""###########################################################################################################################"""
 
 
 
-"""
-TODO:
--Multiple block analyzing.
--Removing loops.
--This can only be used for really simple predicates.
-
-"""
+"""###########################################################################################################################"""
+class State:
+    def __init__(self) -> None:
+        self.rax = 
 
 
 
-
-"""------------------------------"""
+"""###########################################################################################################################"""
 class FunctionOpaqueIdentifier:
-    current_func_name = idaapi.get_func_name(idaapi.get_screen_ea())
-    current_func = idaapi.get_func(idaapi.get_screen_ea())
-    current_ea = idaapi.get_screen_ea()
-
     def __init__(self):
         print("Down the rabbit hole..")
         print("[Topaqueminator] Identifying opaque predicates on function:", self.current_func_name)
+        self.current_func_name = idaapi.get_func_name(idaapi.get_screen_ea())
+        self.current_func = idaapi.get_func(idaapi.get_screen_ea())
+        self.current_ea = idaapi.get_screen_ea()
         self.run()
 
 
@@ -42,37 +37,11 @@ class FunctionOpaqueIdentifier:
             return True
         return False
     
-    def get_basic_blocks_shellcode(self):
+    def get_next_basic_blocks_start_end(self):
         fc = idaapi.FlowChart(self.current_func)
         for block in fc:
-            block_bytes = idc.get_bytes(block.start_ea, block.end_ea - block.start_ea, False)
-            yield block_bytes, block
-
-    def single_block_test(self):
-        for basic_block_bytes, block in self.get_basic_blocks_shellcode():
-            if DEBUG:
-                if basic_block_bytes is not None and self.check_conditional_x86_64(idc.prev_head(block.end_ea)):
-                    if(self.analyze_byte_array(basic_block_bytes)):
-                        print(idautils.DecodeInstruction(idc.prev_head(block.end_ea)).get_canon_mnem())
-                        print("Tomerminatored the opaque.")
-                    else:
-                        print("Not opaque.")
-                    print("this are the blocks start:", hex(block.start_ea), " end:", hex(block.end_ea))
-                    print("======================================================================")
-                    print("====================================================================== \n\n\n\n\n")
-                                  
-    def continous_chunks_test(self):
-        contblock = ""
-        for basic_block_bytes, block in self.get_basic_blocks_shellcode():
-            if DEBUG:
-                contblock += basic_block_bytes
-                if basic_block_bytes is not None and self.check_conditional_x86_64(idc.prev_head(block.end_ea)):
-                    if(self.analyze_byte_array(contblock)):
-                        print("Tomerminatored the opaque.")
-                    else:
-                        print("Not opaque.")
-                print("======================================================================")
-                print("======================================================================")
+            yield block.start_ea, block.end_ea
+    
                     
     def analyze_byte_array(self, bytearray):
         
@@ -146,7 +115,7 @@ class FunctionOpaqueIdentifier:
 
 
     
-"""------------------------------"""
+"""###########################################################################################################################"""
 class Topaqueminator(idaapi.plugin_t):
     flags = idaapi.PLUGIN_UNL
     wanted_name = "Topaqueminator"
@@ -167,7 +136,7 @@ class Topaqueminator(idaapi.plugin_t):
     def term(self):
         print('Made by Tomerminator, use as you wish.')
         print('Topaqueminator finished.')
-"""------------------------------"""
+"""###########################################################################################################################"""
 def PLUGIN_ENTRY():
     try:
         return Topaqueminator()
@@ -175,4 +144,4 @@ def PLUGIN_ENTRY():
         import traceback
         print('Error: %s\n%s' % str((err), traceback.format_exc()))
         raise
-"""------------------------------"""
+"""###########################################################################################################################"""
