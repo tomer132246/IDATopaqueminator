@@ -1,1 +1,1 @@
-xcopy /s /y C:\Users\tomer\Desktop\Reversing\Projects\General\IDATopaquminator_v2 C:\Users\tomer\Desktop\Reversing\IDA_7.6_PRO\plugins
+xcopy /s /y C:\Users\tomer\Desktop\Reversing\Projects\General\IDATopaqueminator\Topaqueminator.py C:\Users\tomer\Desktop\Reversing\IDA_7.6_PRO\plugins
