@@ -1,39 +1,91 @@
-import idaapi, idautils, idc, ida_funcs, ida_auto
+import idaapi, idautils, idc, ida_funcs, ida_auto, ida_bytes    
 import sys
+import os
 sys.stdout.encoding = 'utf-8'
 import angr
 from keystone import *
 from capstone import *
 import logging
 from enum import Enum
-import sark
+import shutil
 import re
 import six
+import sark
+import struct
 ####################################################################
 #Constants.
 ####################################################################
-T_VER = 14
-DEBUG = True
-DEBUG_VERBOSE = False
-DEPTH = 200
-STOP_AFTER_ITERATION = False
-X86_NOP = "\x90"
-patch_info = []
-
 
 """
 TODO:
--DEFLOW implementation.
--restart generator.
--handle never jmp
+-fix the plugin "reload" need
+-move keypatcher to different class
+-check if patching the binary ida is working on is enough, or does angr need to reload it every time.
+-implement deflow algorithm https://ferib.dev/blog.php?l=post/Reversing_Common_Obfuscation_Techniques' (????)
+heuristics:
+    -think about checkign the damage an opaque predicate does to a binary as an heursitic.
+    -think about state explosion heuristic.
+    -think about doing dual jp-mov-jnp fixes ahead.
+-fix non full scan
+-add patterns for found opaques
+-
+
+-PROBLEMS:
+1111111111111111111111111 ON RET_ADDR_CHECK
+.text:000000014209C761                 jo      short loc_14209C76A
+.text:000000014209C763                 mov     bl, bl
+.text:000000014209C765                 jmp     short loc_14209C78E ; Keypatch modified this from:
+.text:000000014209C765 ; END OF FUNCTION CHUNK FOR retAddrCheck ;   jno short loc_14209C78E
+.text:000000014209C765 ; ---------------------------------------------------------------------------
+.text:000000014209C767                 db 81h
+.text:000000014209C768                 db 0C2h, 18h
+.text:000000014209C76A ; ---------------------------------------------------------------------------
+.text:000000014209C76A ; START OF FUNCTION CHUNK FOR retAddrCheck
+.text:000000014209C76A
+.text:000000014209C76A loc_14209C76A:                          ; CODE XREF: retAddrCheck+281↑j
+.text:000000014209C76A                 nop
+.text:000000014209C76B                 jo      short loc_14209C78E
+
+
+22222222222222222222222222 ON EXEC MAYBE
+0x1406272f3
+0x1406272f6
+1 jb 5
+2 jnb 8
+3 db db
+4 db db
+5 jb 8 
+6 db db
+7 db db
 
 """
 
-class OpaqueAnalyzeRetValues(Enum):
-    NOT_OPAQUE = 1
-    ALWAYS_JMP = 2
-    NEVER_JMP = 3
-    ERROR = 4
+
+T_VER = 21
+DEBUG = True
+DEBUG_VERBOSE = False
+CONDITIONAL_JMP_SIZE_IN_BYTES = 2
+DEPTH = 150
+ACTIVE_THERSHOLD_FOR_LAST_PREDICATE_MODE = 700
+TOPAQUE_ANGR_ADDITION = '_Topaqueminator_ver_' + str(T_VER) +'_patched'
+APPLY_PATCHES_ON_INPUT_FILE = True
+CONTINUOS_ANALYZING = False
+TESTS_MODE = False
+
+
+SINGLE_BLOCK_MODE = False
+WHOLE_FUNCTION_MODE = True
+FIX_DEFLOW_MODE = False
+
+
+patch_info = []
+last_found_opaque_predicate = None
+addresses_avoided_set = set()
+addresses_find_set = set()
+opaque_jumpedto_addresses_set = set()
+unfixable_deflow_addresses = set()
+is_last_predicate_mode = False
+
 
 ##################py compitability funcs################################################################
 def to_string(s):
@@ -50,10 +102,7 @@ def to_hexstr(buf, sep=' '):
     if six.PY3 and isinstance(buf, bytes):
         return sep.join("{0:02x}".format(c) for c in buf).upper()
     return sep.join("{0:02x}".format(ord(c)) for c in buf).upper()
-########################################################################################################
-#########################################################################################################
 
-# return a normalized code, or None if input is invalid
 def convert_hexstr(code):
     # normalize code
     code = code.lower()
@@ -84,7 +133,7 @@ def convert_hexstr(code):
         # invalid hex
         return None
 
-#################################################################################################
+#######################################################################################################
 
 ################################ IDA 6/7 Compatibility function #########################################
 def get_dtype(ea, op_idx):
@@ -114,7 +163,6 @@ def read_range_selection():
         return idaapi.read_range_selection(None)
     return idaapi.read_selection()
 #########################################################################################################
-
 
 class Keypatch_Asm:
     # supported architectures
@@ -726,7 +774,7 @@ class Keypatch_Asm:
                 if patch_len < orig_len:
                     padding_len = orig_len - patch_len
                     patch_len = orig_len
-                    patch_data = patch_data.ljust(patch_len, X86_NOP)
+                    patch_data = patch_data.ljust(patch_len, "\x90")
                 elif patch_len > orig_len:
                     patch_end = address + patch_len - 1
                     ins_end = idc.get_item_end(patch_end)
@@ -734,7 +782,7 @@ class Keypatch_Asm:
 
                     if padding_len > 0:
                         patch_len = ins_end - address
-                        patch_data = patch_data.ljust(patch_len, X86_NOP)
+                        patch_data = patch_data.ljust(patch_len, "\x90")
 
                 if padding_len > 0:
                     nop_comment = "\nKeypatch padded NOP to next boundary: {0} bytes".format(padding_len)
@@ -820,7 +868,7 @@ class Keypatch_Asm:
         if padding and self.arch == KS_ARCH_X86:
             for i in range(size -len(patch_data)):
                 assembly_new += ["nop"]
-            patch_data = patch_data.ljust(size, X86_NOP)
+            patch_data = patch_data.ljust(size, "\x90")
 
         (plen, p_orig_data) = self.patch(addr_begin, patch_data, len(patch_data))
         if plen is None:
@@ -889,12 +937,19 @@ class Keypatch_Asm:
         return self.find_idx_by_value(self.syntax_lists, syntax)
     ### /Form helper functions
 
+class OpaqueAnalyzeRetValues(Enum):
+    NOT_OPAQUE = 1
+    ALWAYS_JMP = 2
+    NEVER_JMP = 3
+    CHANGE_MODE = 4
+    ERROR = 5
+
+class OpaqueIdaPatcherRetValues(Enum):
+    SKIP_BLOCK = 1
+    RETURN_TO_MAINLOOP = 2
+    PROCEED = 3
 
 
-
-
-
-"""------------------------------"""
 class FunctionOpaqueIdentifier:
 
     def __init__(self):
@@ -912,14 +967,29 @@ class FunctionOpaqueIdentifier:
 
         self.current_func_name = idaapi.get_func_name(idaapi.get_screen_ea())
         self.current_func = ida_funcs.get_func(idaapi.get_screen_ea())
-        self.angr_prj = angr.Project(idaapi.get_input_file_path(), load_options={'auto_load_libs':False}) 
-
+        self.ida_inputfile_path = idaapi.get_input_file_path()
+        self.inputfile_path = idaapi.get_input_file_path().replace('.exe', '') + TOPAQUE_ANGR_ADDITION + '.exe'
+    
+        logging.debug("Reapplying IDA patches on the operating on exe..")
+        if os.path.isfile(self.inputfile_path):
+            try:
+                os.remove(self.inputfile_path)
+            except:
+                self.inputfile_path = idaapi.get_input_file_path().replace('.exe', '') + TOPAQUE_ANGR_ADDITION + '_f.exe'
+        shutil.copy(self.ida_inputfile_path, self.inputfile_path)
+        self.apply_patch_bytes(self.current_func.start_ea, self.current_func.end_ea)
+        if not TESTS_MODE:
+            logging.debug("Loading angr...")
+            self.angr_prj = angr.Project(self.inputfile_path, load_options={'auto_load_libs':False}) 
+        else:
+            logging.debug("WE ARE IN TESTS MODE. ANGR IS NOT LOADED.")
         self.kp_asm = Keypatch_Asm()
-        
         print("Down the rabbit hole..")
         print("[Topaqueminator] Identifying opaque predicates on function:", self.current_func_name)
         
         self.run()
+
+
 
     def check_if_jmp_x86_64(self, inst_ea):
         inst = idautils.DecodeInstruction(inst_ea).get_canon_mnem()
@@ -927,245 +997,499 @@ class FunctionOpaqueIdentifier:
             return True
         return False
     
+
+
     def check_conditional_x86_64(self, inst_ea):
         inst = idautils.DecodeInstruction(inst_ea).get_canon_mnem()
         if 'j' in inst and 'jmp' not in inst:
             return True
         return False
 
-    def pretty_print_bytes(self, bytes):
+
+
+    def convert_bytes_to_asm_instructions(self, bytes):
         md = Cs(CS_ARCH_X86, CS_MODE_64)
+        asm_str = ""
         for inst in md.disasm(bytes, self.current_func.start_ea):
             print(str(hex(inst.address)) + " " + inst.mnemonic + " " + inst.op_str + ";")
+            asm_str += str(hex(inst.address)) + " " + inst.mnemonic + " " + inst.op_str + ";" +"\n"
+        return asm_str
+
+
 
     def get_the_location_of_the_jump(self, jmp_inst_ea):
         if self.check_if_jmp_x86_64(jmp_inst_ea) or self.check_conditional_x86_64(jmp_inst_ea):
             return idc.get_operand_value(jmp_inst_ea, 0)
         return None
 
+
+
     def fix_function_end(self, new_end_ea):
         logging.debug("Patching function end: {}".format(hex(new_end_ea)))
         #self.current_func.end_ea = new_end_ea
-        ida_auto.auto_wait()
         func_ea = idc.next_head(idc.prev_head(new_end_ea))
-        ida_auto.auto_wait()
         res = ida_funcs.set_func_end(func_ea, new_end_ea)
         logging.debug("set end result: {}".format(res))
-        ida_funcs.reanalyze_function(self.current_func)
-        ida_auto.auto_wait()
+        self.referesh_screen_and_reanalyze()
+
+
+
+    def test_if_instruction_broken(self, inst_addr):
+        if 'j' in idc.print_insn_mnem(inst_addr):
+            if idc.generate_disasm_line(inst_addr, 0)[-2:-1] == "+" and idc.generate_disasm_line(inst_addr,0)[-1:].isdigit():
+                logging.debug("Broken Instruction: {}".format(hex(inst_addr)))
+                return True
+        return False
+
+
+
+    def test_if_instruction_jmp_qword_broken(self, inst_addr):
+        if 'j' in idc.print_insn_mnem(inst_addr):
+            if "+" in idc.generate_disasm_line(inst_addr, 0) and "qword" in idc.generate_disasm_line(inst_addr, 0):
+                logging.debug("Broken qword instruction: {}".format(hex(inst_addr)))
+                return True
+        return False
+    
+
+
+    def fix_jmp_qword(self, inst_addr):
+        code_addr = self.get_the_location_of_the_jump(inst_addr)
+        ret = idc.create_insn(code_addr)
+        self.referesh_screen_and_reanalyze()
+        return ret
+
+
 
     def fix_jmp_inst_on_opaque_predicate(self, opaque_addr):
-        if 'j' in idc.print_insn_mnem(opaque_addr):
-            if idc.generate_disasm_line(opaque_addr, 0)[-2:-1] == "+" and idc.generate_disasm_line(opaque_addr,0)[-1:].isdigit():
-                logging.debug("Broken Instruction: {}".format(hex(opaque_addr)))
-                code_addr = self.get_the_location_of_the_jump(opaque_addr)
-                fix_addr = code_addr -1 
-                idc.del_items(fix_addr,1)
-                idc.create_insn(code_addr)
+        if self.test_if_instruction_broken(opaque_addr) or self.test_if_instruction_jmp_qword_broken(opaque_addr):
+            logging.debug("Fixing broken instruction...")
+            code_addr = self.get_the_location_of_the_jump(opaque_addr)
+            fix_addr = code_addr - int(idc.generate_disasm_line(opaque_addr,0)[-1:])
+            ret_val_del = idc.del_items(fix_addr,1)
+            self.referesh_screen_and_reanalyze()
+            ret_val_create = idc.create_insn(code_addr)
+            self.referesh_screen_and_reanalyze()
+            if ret_val_create == 0 or ret_val_del == False:
+                return False
+            return True
+        return False
 
-    def fix_opaque_predicate(self, opaque_addr, opaque_type_num):
+
+
+    def referesh_screen_and_reanalyze(self):
+        ida_auto.auto_wait()
+        idaapi.reanalyze_function(self.current_func)
+        ida_auto.auto_wait()
+
+
+
+    def tompaque_patch_code(self, instruction_string, address):
+        cmt = "Topaque Patched from: {}".format(idc.generate_disasm_line(address, 0)) + "\n" + "\tTopaque Patched to: " + instruction_string
+        self.kp_asm.patch_code(address, instruction_string, KS_ARCH_X86, 1, 0, patch_comment=cmt)
+        idc.set_cmt(address, cmt, False)
+        self.referesh_screen_and_reanalyze()
+        if APPLY_PATCHES_ON_INPUT_FILE:
+            self.apply_patch_bytes(self.current_func.start_ea, self.current_func.end_ea)
+        self.referesh_screen_and_reanalyze()
+
+
+
+    def fix_opaque_predicate(self, opaque_addr, opaque_type_num, different_addr = None):
         if opaque_type_num == OpaqueAnalyzeRetValues.ALWAYS_JMP:
-            jmp_location_str = hex(self.get_the_location_of_the_jump(opaque_addr))
+            if different_addr is not None:
+                jmp_location_str = different_addr
+            else:
+                jmp_location_str = hex(self.get_the_location_of_the_jump(opaque_addr))
             raw_assembly = "jmp " + jmp_location_str
-            self.kp_asm.patch_code(opaque_addr, raw_assembly, KS_ARCH_X86, 1, "Patched")
+            self.tompaque_patch_code(raw_assembly, opaque_addr)
+            self.referesh_screen_and_reanalyze()
+        elif opaque_type_num == OpaqueAnalyzeRetValues.NEVER_JMP:
+            raw_assembly = "nop"
+            self.tompaque_patch_code(raw_assembly, opaque_addr)
+            self.referesh_screen_and_reanalyze()
+
+
 
     def fix_undef_code_places(self, predicate_ea):
         idc.create_insn(predicate_ea)
-        ida_auto.auto_wait
-        ida_funcs.reanalyze_function(self.current_func)
-        ida_auto.auto_wait()
-
-    def patch_opaque_predicates_loop(self):
-        done = False
-        fc = idaapi.FlowChart(self.current_func)
-        counter = 0
-        for block in fc:
-            print("======================================================================")
-            print("======================================================================")
-            opaque_addr = idc.prev_head(block.end_ea)
-            if (self.check_conditional_x86_64(idc.prev_head(block.end_ea))):
-                print("Found conditional jump address in: ", hex(idc.prev_head(block.end_ea)))
-                analyze_res = self.analyze_opaque(idc.prev_head(block.end_ea))
-                if analyze_res != OpaqueAnalyzeRetValues.NOT_OPAQUE:
-                    print("Opaque conditional jump address is: ", hex(idc.prev_head(block.end_ea)))
-                    if analyze_res == OpaqueAnalyzeRetValues.ALWAYS_JMP:
-                        self.fix_jmp_inst_on_opaque_predicate(opaque_addr)
-                        self.fix_function_end(block.end_ea)
-                        logging.debug("Opaque type is ALWAYS JMP")
-                    elif analyze_res == OpaqueAnalyzeRetValues.NEVER_JMP:
-                        logging.debug("Opaque type is NEVER JMP")
-                        break;
-                    else:
-                        while(self.analyze_opaque(idc.prev_head(block.end_ea)) == OpaqueAnalyzeRetValues.ERROR):
-                            pass
-                        
-                    self.fix_opaque_predicate(opaque_addr, analyze_res)
+        self.referesh_screen_and_reanalyze()
 
 
-                    print("Tomerminatored the opaque.")
-                    done = STOP_AFTER_ITERATION
-            else:
-                print("Block appened, conditional jump not found.")  
 
-            print("Iteration Done.")
-            if done:
+    def fix_using_single_block_analysis(self):
+         #single block anaylsis.
+        while(SINGLE_BLOCK_MODE and self.patch_opaque_predicates_loop(SINGLE_BLOCK_MODE)):
+            if not CONTINUOS_ANALYZING:
                 break
-            counter += 1
-            if counter == DEPTH:
-                logging.debug("MAX DEPTH ACHIEVED, STOPPING.")
-                break
-
-    def patch_opaque_predicates(self):
-        #block_bytes does not include the instruction after the jmp BUT, block.end - block.start does.
-        done = False
-        fc = idaapi.FlowChart(self.current_func)
-        counter = 0
-        for block in fc:
-            print("======================================================================")
-            print("======================================================================")
-            opaque_addr = idc.prev_head(block.end_ea)
-            if (self.check_conditional_x86_64(idc.prev_head(block.end_ea))):
-                print("Found conditional jump address in: ", hex(idc.prev_head(block.end_ea)))
-                analyze_res = self.analyze_opaque(idc.prev_head(block.end_ea))
-                if analyze_res != OpaqueAnalyzeRetValues.NOT_OPAQUE:
-                    print("Opaque conditional jump address is: ", hex(idc.prev_head(block.end_ea)))
-                    if analyze_res == OpaqueAnalyzeRetValues.ALWAYS_JMP:
-                        self.fix_jmp_inst_on_opaque_predicate(opaque_addr)
-                        self.fix_function_end(block.end_ea)
-                        logging.debug("Opaque type is ALWAYS JMP")
-                    elif analyze_res == OpaqueAnalyzeRetValues.NEVER_JMP:
-                        logging.debug("Opaque type is NEVER JMP")
-                        break;
-                    else:
-                        while(self.analyze_opaque(idc.prev_head(block.end_ea)) == OpaqueAnalyzeRetValues.ERROR):
-                            pass
-                        
-                    self.fix_opaque_predicate(opaque_addr, analyze_res)
-
-
-                    print("Tomerminatored the opaque.")
-                    done = STOP_AFTER_ITERATION
-            else:
-                print("Block appened, conditional jump not found.")  
-
-            print("Iteration Done.")
-            if done:
-                break
-            counter += 1
-            if counter == DEPTH:
-                logging.debug("MAX DEPTH ACHIEVED, STOPPING.")
+        return
+    
+    def fix_using_whole_function_analysis(self):
+        #next iteration start each time from start (whol func analysis)
+        while (self.patch_opaque_predicates_loop(False)):
+             if not CONTINUOS_ANALYZING:
                 break
     
-    def analyze_opaque(self, predicate_ea):
-        s = self.angr_prj.factory.blank_state(addr=self.current_func.start_ea)
-        #TODO: think about exploration techniques, do it like this tomer:
-        # simgr.use_technique(angr.exploration_techniques.Symbion(find=[address], memory_concretize=memory_concretize,
-                                                            #register_concretize=register_concretize, timeout=timeout))
-        #exploration = simgr.run()
-        ###3
-        #ignore func calls
-        s.options.add(angr.options.CALLLESS)
-        s.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
-        s.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
 
-        simMgr = self.angr_prj.factory.simgr(s)
 
-        predicate_jmp_address_operand = self.get_the_location_of_the_jump(predicate_ea)
-
-        # Run the code until all paths have errored or the full shellcode has ran
-        #FIND is the address RIGHT AFTER the jump.
-        #AVOID is the location we maybe will jump to.
-        #if all states when we finish are in avoid, than we always jump.
-        #if all states when we finish are in found, we never jump
-        #if found size is 0, we always jump
-
-        simMgr.explore(find=[idaapi.next_head(predicate_ea, predicate_ea+0x100), idc.next_addr(predicate_ea)], avoid=predicate_jmp_address_operand)
-        if '0xffffffffffffffff' in hex(idaapi.next_head(predicate_ea, predicate_ea+0x10)):
-            #create code at predicate, anaylze function, return not opaque
-            logging.warning("some code needs to be defined manually.")
-            self.fix_undef_code_places(predicate_ea)
-            return OpaqueAnalyzeRetValues.ERROR
+    def deflow_main_loop(self):
+        pass
         
-        logging.debug("find: {}".format(hex(idaapi.next_head(predicate_ea, predicate_ea+0x100))))
-        logging.debug("avoid: {}".format(hex(predicate_jmp_address_operand)))
-        logging.debug("SimMgr: {}".format(simMgr))
 
-        total_stashes_len = 0
 
-        if len(simMgr.found) == 0 and len(simMgr.unconstrained) == 0:
-            logging.debug("len(simMgr.found) == 0 and len(simMgr.unconstrained) == 0")
-            return OpaqueAnalyzeRetValues.ALWAYS_JMP
-        else:
-            for stash in simMgr.stashes:
-                total_stashes_len += len(stash)
-            total_stashes_len -= len(simMgr.found)
-            if total_stashes_len == 0:
-                logging.debug("len(simMgr.found) != 0 or len(simMgr.unconstrained) != 0, total_stashes_len = len(found)")
-                return OpaqueAnalyzeRetValues.NEVER_JMP
+
+    def fix_using_deflow(self):
+        logging.debug(f"Text section start: {hex(idaapi.get_segm_by_name('.text').start_ea)}")
+        logging.debug(f"Text section end: {hex(idaapi.get_segm_by_name('.text').end_ea)}")
+        text_section_start_ea = idaapi.get_segm_by_name('.text').start_ea
+        text_section_end_ea = idaapi.get_segm_by_name('.text').end_ea
+        text_section_bytes_buffer = idc.get_bytes(text_section_start_ea, text_section_end_ea - text_section_start_ea)
+        function_start_offset = self.current_func.start_ea - text_section_start_ea    
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        base = text_section_start_ea
+        md.disasm(text_section_bytes_buffer, function_start_offset)
+
+
+
+
+    def unravel_jmp_chains(self, opaque_addr):
+        if self.check_conditional_x86_64(opaque_addr) or self.check_if_jmp_x86_64(opaque_addr):
+            next_jmp_loc = self.get_the_location_of_the_jump(opaque_addr)
+            init_inst_string = idautils.DecodeInstruction(opaque_addr).get_canon_mnem()
+            jmp_inst_string = idautils.DecodeInstruction(next_jmp_loc).get_canon_mnem()
+            counter = 0
+            while(self.check_conditional_x86_64(next_jmp_loc) and (init_inst_string == jmp_inst_string)):
+                counter += 1
+                next_jmp_loc = self.get_the_location_of_the_jump(next_jmp_loc)
+                logging.debug(f"{next_jmp_loc}")
+                if next_jmp_loc is None:
+                    logging.debug("unravel_jmp_chains next_jmp_loc is None ")
+                jmp_inst_string = idautils.DecodeInstruction(next_jmp_loc).get_canon_mnem()
+                
+            return (counter > 0), next_jmp_loc
+        return False, None
+
+
+
+    def ida_pre_explore_patch(self, block, is_single_block_mode):
+        global last_found_opaque_predicate
+        global is_last_predicate_mode
+        logging.debug("INSIDE ida_pre_explore_patch(self, block, is_single_block_mode):")
+        opaque_addr = idc.prev_head(block.end_ea)
+        #fix idas stupid shit, than continue with trying to analyze opaque.
+        is_unraveled, final_jmp_loc = self.unravel_jmp_chains(opaque_addr)
+        
+        if is_unraveled:
+            inst_cmd_str = idautils.DecodeInstruction(opaque_addr).get_canon_mnem()
+            logging
+            self.tompaque_patch_code(inst_cmd_str + " {}".format(hex(final_jmp_loc)), opaque_addr)
+            return OpaqueIdaPatcherRetValues.RETURN_TO_MAINLOOP
+        
+        if is_single_block_mode:
+            #handle the case of single jump blocks. they are NOT opaque.
+            if 'j' in idc.print_insn_mnem(block.start_ea):
+                logging.debug("single block start from JMP instruction is NOT opaque. block_start_ea: {} ".format(hex(block.start_ea)))
+                return OpaqueIdaPatcherRetValues.SKIP_BLOCK
+        
+        if is_last_predicate_mode:
+            if(last_found_opaque_predicate == None):
+                logging.debug("we are in last found mode, but last_found_opaq is None.")
+                raise "Error: we are in last found mode, but last_found_opaq is None."
+                
+            if block.start_ea < self.get_the_location_of_the_jump(last_found_opaque_predicate):
+                logging.debug("block.start_ea < self.get_the_location_of_the_jump(last_found_opaque_predicate), skipping block")
+                return OpaqueIdaPatcherRetValues.SKIP_BLOCK
+
+        if self.check_conditional_x86_64(opaque_addr) or self.check_if_jmp_x86_64(opaque_addr):
+            jump_to_operand_location_value = self.get_the_location_of_the_jump(opaque_addr)
+            if self.test_if_instruction_broken(opaque_addr) or self.test_if_instruction_jmp_qword_broken(opaque_addr):
+                if idaapi.get_func(jump_to_operand_location_value) is None: #was jump + 0x15
+                    logging.debug("Chunk does not belone to any function, create and set func end")
+                    #func_ea = block.end_ea
+                    if self.fix_jmp_inst_on_opaque_predicate(opaque_addr) == False:
+                        logging.debug("UNABLE TO FIX BROKEN INSTRUCTION, PROCEEDING..")
+                        return OpaqueIdaPatcherRetValues.PROCEED
+                    #idc.set_func_end(func_ea, jump_to_operand_location_value + 0x10)
+                    self.referesh_screen_and_reanalyze()
+                    return OpaqueIdaPatcherRetValues.RETURN_TO_MAINLOOP
+                if jump_to_operand_location_value < opaque_addr:
+                    #broken instuction + opaque address
+                    #TODO: if we are at the beginning, return false and let the user decide.
+                    raise ValueError("SELF DECRYPTING CODE FOUND. PLEASE HANDLY MANUALLY.")
+                    #self.tompaque_patch_code("nop", opaque_addr)
+                    #return OpaqueIdaPatcherRetValues.RETURN_TO_MAINLOOP
+            if jump_to_operand_location_value < opaque_addr:
+                    #we are in a loop, analyze the next instruction. no point in analyzing this one.  
+                    return OpaqueIdaPatcherRetValues.SKIP_BLOCK
+            else:
+                #cond jmp is 2 bytes
+                if idc.next_head(opaque_addr) - (opaque_addr+CONDITIONAL_JMP_SIZE_IN_BYTES) == 1:
+                    #is conditional, instruction not broken, next head is 1 bytes fucking close.
+                    #they are doing that stupid shit again. ja jb [x] jb [x
+                    logging.debug("is conditional, instruction not broken, next head is 1 bytes fucking close.")
+                    logging.debug("they are doing that stupid shit again. ja jb [x] jb [x")
+                    if self.check_if_jmp_x86_64(opaque_addr):
+                        return OpaqueIdaPatcherRetValues.PROCEED
+                    if final_jmp_loc is not None:
+                        self.handle_found_opaque_predicate(OpaqueAnalyzeRetValues.ALWAYS_JMP, opaque_addr, block)
+                    last_found_opaque_predicate = opaque_addr
+                    return OpaqueIdaPatcherRetValues.RETURN_TO_MAINLOOP
+                              
+        return OpaqueIdaPatcherRetValues.PROCEED
+
+
+
+    def handle_found_opaque_predicate(self, analyze_res, opaque_addr, block, different_addr = None):
+        global is_last_predicate_mode
+        if (analyze_res == OpaqueAnalyzeRetValues.ALWAYS_JMP) or (analyze_res == OpaqueAnalyzeRetValues.NEVER_JMP):
+            #Opaque was found, restart the function analysis.
+            #TODO: currently, angr is working on the binary, meaning if IDA patched the bytes it does not mean angr seen it.
+            #think of something clever to solve that.
+            print("######## - OPAQUE FOUND - ########")
+            print("Opaque conditional jump address is: ", hex(opaque_addr))
+            if analyze_res == OpaqueAnalyzeRetValues.ALWAYS_JMP:
+                self.fix_jmp_inst_on_opaque_predicate(opaque_addr)
+                if sum(1 for _ in (idautils.CodeRefsTo(idc.next_head(opaque_addr), 1))) == 1:
+                    logging.debug("No xrefs, patching opaque func chunk end")
+                    #if there are no xrefs to the next line, fix the function chunk end.
+                    self.fix_function_end(block.end_ea)
+                logging.debug("Opaque type is ALWAYS JMP")
+            elif analyze_res == OpaqueAnalyzeRetValues.NEVER_JMP:
+                logging.debug("Opaque type is NEVER JMP")
+            else:
+                    logging.error("PROBABLY SHOULDNT BE HERE \nError was returned, probably trying to go to a chunk that is not a part of fuction.\n")
+                    raise "ERROR"
+            print("Starting to patch the opaque")
+            self.fix_opaque_predicate(opaque_addr, analyze_res, different_addr)
+            print("Tomerminatored the opaque.")
+            return True
+        if analyze_res == OpaqueAnalyzeRetValues.CHANGE_MODE:
+            logging.debug("Changing mode.. to many active shitty states.")
+            is_last_predicate_mode = True
+        if analyze_res == OpaqueAnalyzeRetValues.NOT_OPAQUE:
+            if self.fix_jmp_inst_on_opaque_predicate(opaque_addr):
+                return True
+
+        return False
+
+
+    def patch_opaque_predicates_loop(self, is_single_block_mode):
+        global is_last_predicate_mode
+        self.referesh_screen_and_reanalyze()
+        fc = idaapi.FlowChart(self.current_func)
+        counter = 0
+        
+        #MAIN LOOP
+        for block in fc:
+            print("======================================================================")
             
-        total_stashes_len = 0
+            self.referesh_screen_and_reanalyze()
+            opaque_addr = idc.prev_head(block.end_ea)
+            patch_retval = self.ida_pre_explore_patch(block, is_single_block_mode)
+            
+            if patch_retval == OpaqueIdaPatcherRetValues.SKIP_BLOCK:
+                continue
+            if patch_retval == OpaqueIdaPatcherRetValues.RETURN_TO_MAINLOOP:
+                return True
+            if patch_retval == OpaqueIdaPatcherRetValues.PROCEED:
+                pass
 
-        for stash in simMgr.stashes:
-            total_stashes_len += len(stash)
-        total_stashes_len -= len(simMgr.avoid)
-        if total_stashes_len == 0:
-            logging.debug("total_stashes_len = len(avoid)")
-            return OpaqueAnalyzeRetValues.ALWAYS_JMP
-        
-        return OpaqueAnalyzeRetValues.NOT_OPAQUE
+            if (self.check_conditional_x86_64(opaque_addr)):
+                print("Found conditional jump address in: ", hex(opaque_addr), ".\n Starting to explore.")
+                analyze_res = self.explore_for_opaques(opaque_addr, is_single_block_mode, block.start_ea)
+                if self.handle_found_opaque_predicate(analyze_res, opaque_addr, block):
+                    return True
+            else:
+                print("conditional jump not found.")  
+
+            print("Iteration Done.")
+            counter += 1
+            if counter == DEPTH:
+                logging.debug("MAX ITERATIONS, STOPPING.")
+                break
     
-    def shell_test(self):
-        CODE1 = ["xor rax, rax;",
-        "mov rax, rbx;",
-        "xor rax, rcx;",
-        "xor rax,rax",
-        "jnz 0x41444;",
-        "mov rax, rcx",
-        "jz 0x4143B;",
-        ]
+        return False
 
-        CODE2 = ["xor rax, rax;",
-        "mov rax, rbx;",
-        "xor rax, rcx;",
-        "jnz 0x41444;",
-        "mov rax, rcx",
-        "xor rbx, rcx",
-        "jz 0x4143B;",
-        ]
 
-        CODE3 = ["stc;",
-        "xchg bh, bh;",
-        "movzx	eax, byte ptr [rcx + 0x7e];",
-        "movzx	eax, byte ptr [rcx + 0x7e];",
-        "mov	qword ptr [rbp], rdx;",
-        "lea	rdx, [rip - 0xc7c];",
-        "call 0x2311111;",
-        "stc;",
-        "jbe 0x1240;",
-        ]
-        
-        
+
+    def convert_asm_string_to_bytes(self, asm_str)->bytes:
         ks = Ks(KS_ARCH_X86, KS_MODE_64)
-        code_instructions = []
         all_shell_code = b""
-        for inst in CODE3:
+        for inst in asm_str:
             encoding, count = ks.asm(inst)
             opcodes = b""
             for i in encoding:
                 opcodes += bytes([i])
             all_shell_code += opcodes
-            code_instructions.append(opcodes)
+
+
+
+    def pre_explore_get_ea_of_execution_start(self, is_single_block_mode, block_start_ea):
+        global last_found_opaque_predicate
+        global is_last_predicate_mode
+        start_ea = 0x0
+        if (last_found_opaque_predicate is not None) and is_last_predicate_mode:
+            start_ea = self.get_the_location_of_the_jump(last_found_opaque_predicate)
+            logging.debug("Start from last found predicate, not function start.")
+        else:
+            start_ea = self.current_func.start_ea
+
+        if is_single_block_mode:
+            start_ea = block_start_ea
+
+        if (not is_last_predicate_mode) and (not is_single_block_mode):
+            start_ea = self.current_func.start_ea
+        
+        return start_ea
+
+
+
+    def apply_pre_explore_heursitcs(self, predicate_ea):
+        global addresses_avoided_set
+        global addresses_find_set
+        predicate_jmp_address_operand = self.get_the_location_of_the_jump(predicate_ea)
+
+        #Append invariants
+        addresses_avoided_set.add(predicate_jmp_address_operand)
+        addresses_find_set.add(idaapi.next_head(predicate_ea, predicate_ea+0xF))
+        addresses_find_set.add(idc.next_addr(predicate_ea))
+
+        logging.debug("PRE EXPLORE: Avoid set is: [{}]".format(', '.join(hex(x) for x in addresses_avoided_set)))
+        logging.debug("PRE EXPLORE: Find set is: [{}]".format(', '.join(hex(x) for x in addresses_find_set)))
+        
+
+
+    def evaluate_explore_results(self, simMgr):
+        logging.debug("SimMgr: {}".format(simMgr))
+        total_stashes_len = 0
+
+        for stash in simMgr.stashes:
+            total_stashes_len += len(stash)
+
+        if len(simMgr.unconstrained) == total_stashes_len:
+            raise ValueError("All states ended unconstrained.")
+            return OpaqueAnalyzeRetValues.NOT_OPAQUE
+        
+        if len(simMgr.found) == 0:
+            logging.debug("len(simMgr.found) == 0 and len(simMgr.unconstrained) == 0")
+            return OpaqueAnalyzeRetValues.ALWAYS_JMP
+        else:
+            if total_stashes_len - len(simMgr.found) == 0:
+                logging.debug("len(simMgr.found) != 0 or len(simMgr.unconstrained) != 0, total_stashes_len = len(found)")
+                return OpaqueAnalyzeRetValues.NEVER_JMP
+            if total_stashes_len - len(simMgr.avoid) == 0:
+                logging.debug("total_stashes_len = len(avoid)")
+                return OpaqueAnalyzeRetValues.ALWAYS_JMP
+        
+        return OpaqueAnalyzeRetValues.NOT_OPAQUE
+
+
+
+    def patch_bytes_on_position(self, ea, fpos, org_val, patch_val):
+        if fpos != -1:
+            self.inputfile_obj.seek(fpos)
+            self.inputfile_obj.write(struct.pack('B', patch_val))
+        return 0
+
+
+
+    def apply_patch_bytes(self, start_ea, end_ea):
+        self.inputfile_obj = open(self.inputfile_path, 'rb+')
+        idaapi.visit_patched_bytes(start_ea, end_ea, self.patch_bytes_on_position)
+        self.inputfile_obj.close()
+
+
+
+    def apply_post_explore_heuristics(self, ret_code, predicate_ea, simMgr):     
+        global last_found_opaque_predicate
+        global addresses_avoided_set
+        global addresses_find_set
+        global opaque_jumpedto_addresses_set
+        ret_code = ret_code
+        predicate_jmp_address_operand = self.get_the_location_of_the_jump(predicate_ea)
+        
+        #restore invaraints.
+        #TODO: think of heuristic.
+        addresses_avoided_set.remove(predicate_jmp_address_operand)
+        addresses_find_set.clear()
+        if (ret_code != OpaqueAnalyzeRetValues.NOT_OPAQUE):
+            last_found_opaque_predicate = predicate_ea
+            opaque_jumpedto_addresses_set.add(predicate_jmp_address_operand)
+
+        if len(simMgr.active) > ACTIVE_THERSHOLD_FOR_LAST_PREDICATE_MODE:
+            ret_code = OpaqueAnalyzeRetValues.CHANGE_MODE
+            
+             
+
+        logging.debug("POST EXPLORE: Avoid set is: [{}]".format(', '.join(hex(x) for x in addresses_avoided_set)))
+        logging.debug("POST EXPLORE: Find set is: [{}]".format(', '.join(hex(x) for x in addresses_find_set)))
+        return ret_code
+    
+    
+    @staticmethod
+    def avoid_function(state):
+        return state.addr >= min(addresses_avoided_set)
+   
+   
+    @staticmethod
+    def find_function(state):
+        return (state.addr >= min(addresses_find_set)) and (state.addr <= max(addresses_find_set))
+    
+    
+    
+    def explore_for_opaques(self, predicate_ea, is_single_block_mode, block_start_ea):
+        start_ea = 0x0
+        ret_code = OpaqueAnalyzeRetValues.NOT_OPAQUE
+
+        start_ea = self.pre_explore_get_ea_of_execution_start(is_single_block_mode, block_start_ea)
+        
+        #ignore func call
+        s = self.angr_prj.factory.blank_state(addr=start_ea)
+        s.options.add(angr.options.CALLLESS)
+        #s.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
+        #s.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
+        #s.options.add(angr.options.SYMBOLIC)
+        #s.options.add(angr.options.SYMBOLIC_INITIAL_VALUES)
+        #s.options.add(angr.options.ABSTRACT_MEMORY)
+        
+        simMgr = self.angr_prj.factory.simgr(s)
+
+        self.apply_pre_explore_heursitcs(predicate_ea)
+        
+        simMgr.explore(find=FunctionOpaqueIdentifier.find_function, avoid=FunctionOpaqueIdentifier.avoid_function)
+        
+        ret_code = self.evaluate_explore_results(simMgr)
+    
+        ret_code = self.apply_post_explore_heuristics(ret_code, predicate_ea, simMgr)
+    
+        return ret_code
+
+   
+   
+    def patch_opaque_predicates(self):
+        
+        if(FIX_DEFLOW_MODE):
+            logging.debug("Deflow fix running.")
+            self.fix_using_deflow()
+        if(SINGLE_BLOCK_MODE):
+            logging.debug("Single block level opaque removal fix running.")
+            self.fix_using_single_block_analysis()
+        elif(WHOLE_FUNCTION_MODE):
+            logging.debug("Whole function level opaque removal fix running.")
+            self.fix_using_whole_function_analysis()
+
+
 
     def run(self):
         self.patch_opaque_predicates()
+        #self.fix_using_deflow()
         
         
         
-            
+        
+        
 
-    
-         
-            
+def run_main_class():
+    analyze = FunctionOpaqueIdentifier()
                 
         
 
@@ -1186,7 +1510,7 @@ class Topaqueminator(idaapi.plugin_t):
         return idaapi.PLUGIN_OK
     
     def run(self, ctx):
-        FunctionOpaqueIdentifier()
+        run_main_class()
        
         
 
